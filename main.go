@@ -766,6 +766,9 @@ func execCommand(args map[string]interface{}) (interface{}, string) {
 	}
 	dir := appDir
 	if d, ok := args["dir"].(string); ok && d != "" {
+		if !isAllowedPath(d) {
+			return nil, "Dir not allowed (allowed: " + strings.Join(allowedDirs, ", ") + ")"
+		}
 		dir = d
 	}
 	cmdArgs := strList(args["args"])
