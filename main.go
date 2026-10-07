@@ -13,6 +13,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // MCP Message types
@@ -72,7 +74,7 @@ func init() {
 		appDir = "/opt/app"
 	}
 	if dbPath == "" {
-		dbPath = "/opt/app/data/pgease.db"
+		dbPath = filepath.Join(appDir, "data", "pgease.db")
 	}
 	allowedDirs = []string{appDir}
 }
@@ -713,8 +715,11 @@ func dbQuery(args map[string]interface{}) (interface{}, string) {
 		return nil, "Only SELECT queries allowed"
 	}
 
-	// Try SQLite first
-	db, err := sql.Open("sqlite3", dbPath)
+	if _, err := os.Stat(dbPath); err != nil {
+		return nil, "No database at " + dbPath + " (set DATABASE_PATH)"
+	}
+	// Read-only: mode=ro blocks writes even if a non-SELECT slips past the prefix check.
+	db, err := sql.Open("sqlite3", "file:"+dbPath+"?mode=ro")
 	if err != nil {
 		return nil, fmt.Sprintf("DB error: %v", err)
 	}
