@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -9,7 +10,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"time"
 )
 
 // MCP Message types
@@ -178,7 +181,7 @@ func handleToolsList(msg *Message) {
 		},
 		{
 			"name":        "git_commit",
-			"description": "Git commit changes",
+			"description": "Git commit. paths: commit only these files. all=true: stage everything (git add -A). Neither: commit what is already staged.",
 			"inputSchema": map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -186,13 +189,22 @@ func handleToolsList(msg *Message) {
 						"type":        "string",
 						"description": "Commit message",
 					},
+					"paths": map[string]interface{}{
+						"type":        "array",
+						"items":       map[string]interface{}{"type": "string"},
+						"description": "Files to stage and commit (relative to repo)",
+					},
+					"all": map[string]interface{}{
+						"type":        "boolean",
+						"description": "Stage all changes incl. untracked (git add -A)",
+					},
 				},
 				"required": []string{"message"},
 			},
 		},
 		{
 			"name":        "git_push",
-			"description": "Git push to remote",
+			"description": "Git push to origin. Default branch: current (HEAD).",
 			"inputSchema": map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -201,6 +213,33 @@ func handleToolsList(msg *Message) {
 						"description": "Branch to push (default: current)",
 					},
 				},
+			},
+		},
+		{
+			"name":        "git_diff",
+			"description": "Git diff (output capped at 200KB)",
+			"inputSchema": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"paths":  map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}, "description": "Limit to these paths"},
+					"staged": map[string]interface{}{"type": "boolean", "description": "Diff staged changes (--cached)"},
+					"stat":   map[string]interface{}{"type": "boolean", "description": "Summary only (--stat)"},
+					"ref":    map[string]interface{}{"type": "string", "description": "Compare against ref/commit (e.g. HEAD~1)"},
+				},
+			},
+		},
+		{
+			"name":        "file_patch",
+			"description": "Replace exact text in a file (str_replace). old_str must match exactly once unless replace_all.",
+			"inputSchema": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"path":        map[string]interface{}{"type": "string", "description": "File path"},
+					"old_str":     map[string]interface{}{"type": "string", "description": "Exact text to replace"},
+					"new_str":     map[string]interface{}{"type": "string", "description": "Replacement text (may be empty)"},
+					"replace_all": map[string]interface{}{"type": "boolean", "description": "Replace every occurrence"},
+				},
+				"required": []string{"path", "old_str", "new_str"},
 			},
 		},
 		{
@@ -270,7 +309,7 @@ func handleToolsList(msg *Message) {
 		},
 		{
 			"name":        "exec",
-			"description": "Execute shell command",
+			"description": "Execute command (no shell unless command=sh). Destructive patterns are blocked. Output returned even on failure.",
 			"inputSchema": map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -285,6 +324,10 @@ func handleToolsList(msg *Message) {
 					"dir": map[string]interface{}{
 						"type":        "string",
 						"description": "Working directory",
+					},
+					"timeout_sec": map[string]interface{}{
+						"type":        "integer",
+						"description": "Kill after N seconds (default 25, max 600)",
 					},
 				},
 				"required": []string{"command"},
@@ -336,6 +379,10 @@ func handleToolCall(msg *Message) {
 		result, errMsg = gitPush(args)
 	case "git_status":
 		result, errMsg = gitStatus()
+	case "git_diff":
+		result, errMsg = gitDiff(args)
+	case "file_patch":
+		result, errMsg = filePatch(args)
 	case "docker_compose_up":
 		result, errMsg = dockerComposeUp(args)
 	case "docker_compose_down":
@@ -353,7 +400,20 @@ func handleToolCall(msg *Message) {
 	}
 
 	if errMsg != "" {
-		sendError(msg.ID, -32603, errMsg)
+		text := errMsg
+		if result != nil {
+			if out := fmt.Sprintf("%v", result); out != "" {
+				text += "\n" + out
+			}
+		}
+		sendJSON(map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      msg.ID,
+			"result": map[string]interface{}{
+				"content": []map[string]interface{}{{"type": "text", "text": text}},
+				"isError": true,
+			},
+		})
 		return
 	}
 
@@ -380,7 +440,7 @@ func isAllowedPath(path string) bool {
 	}
 	for _, allowed := range allowedDirs {
 		absAllowed, _ := filepath.Abs(allowed)
-		if strings.HasPrefix(absPath, absAllowed) {
+		if absPath == absAllowed || strings.HasPrefix(absPath, absAllowed+string(filepath.Separator)) {
 			return true
 		}
 	}
@@ -446,44 +506,124 @@ func gitPull(args map[string]interface{}) (interface{}, string) {
 
 func gitCommit(args map[string]interface{}) (interface{}, string) {
 	msg, ok := args["message"].(string)
-	if !ok {
+	if !ok || msg == "" {
 		return nil, "Missing message"
 	}
-
-	// Stage all changes
-	stageCmd := exec.Command("git", "add", "-A")
-	stageCmd.Dir = appDir
-	if _, err := stageCmd.CombinedOutput(); err != nil {
-		return nil, fmt.Sprintf("Git add error: %v", err)
+	paths := strList(args["paths"])
+	all, _ := args["all"].(bool)
+	for _, p := range paths {
+		if strings.HasPrefix(p, "-") {
+			return nil, "Invalid path: " + p
+		}
 	}
-
-	// Commit
-	commitCmd := exec.Command("git", "commit", "-m", msg)
-	commitCmd.Dir = appDir
-	output, err := commitCmd.CombinedOutput()
-
+	commitArgs := []string{"commit", "-m", msg}
+	switch {
+	case len(paths) > 0:
+		if out, err := runIn(appDir, 60*time.Second, "git", append([]string{"add", "--"}, paths...)...); err != nil {
+			return out, fmt.Sprintf("Git add error: %v", err)
+		}
+		commitArgs = append(append(commitArgs, "--"), paths...)
+	case all:
+		if out, err := runIn(appDir, 60*time.Second, "git", "add", "-A"); err != nil {
+			return out, fmt.Sprintf("Git add error: %v", err)
+		}
+	}
+	out, err := runIn(appDir, 120*time.Second, "git", commitArgs...)
 	if err != nil {
-		return string(output), fmt.Sprintf("Git commit error: %v", err)
+		return out, fmt.Sprintf("Git commit error: %v", err)
 	}
-
-	return string(output), ""
+	return out, ""
 }
 
 func gitPush(args map[string]interface{}) (interface{}, string) {
-	branch := "main"
-	if b, ok := args["branch"].(string); ok {
-		branch = b
+	branch, _ := args["branch"].(string)
+	if branch == "" {
+		out, err := runIn(appDir, 10*time.Second, "git", "rev-parse", "--abbrev-ref", "HEAD")
+		if err != nil {
+			return out, fmt.Sprintf("Cannot resolve current branch: %v", err)
+		}
+		branch = strings.TrimSpace(out)
 	}
-
-	cmd := exec.Command("git", "push", "origin", branch)
-	cmd.Dir = appDir
-	output, err := cmd.CombinedOutput()
-
+	if branch == "" || branch == "HEAD" || strings.HasPrefix(branch, "-") {
+		return nil, "Detached HEAD or invalid branch; pass branch explicitly"
+	}
+	out, err := runIn(appDir, 120*time.Second, "git", "push", "origin", branch)
+	out = "branch: " + branch + "\n" + out
 	if err != nil {
-		return string(output), fmt.Sprintf("Git push error: %v", err)
+		return out, fmt.Sprintf("Git push error: %v", err)
 	}
+	return out, ""
+}
 
-	return string(output), ""
+func gitDiff(args map[string]interface{}) (interface{}, string) {
+	cmdArgs := []string{"diff", "--no-color"}
+	if v, _ := args["staged"].(bool); v {
+		cmdArgs = append(cmdArgs, "--cached")
+	}
+	if v, _ := args["stat"].(bool); v {
+		cmdArgs = append(cmdArgs, "--stat")
+	}
+	if ref, _ := args["ref"].(string); ref != "" {
+		if strings.HasPrefix(ref, "-") {
+			return nil, "Invalid ref"
+		}
+		cmdArgs = append(cmdArgs, ref)
+	}
+	if paths := strList(args["paths"]); len(paths) > 0 {
+		cmdArgs = append(append(cmdArgs, "--"), paths...)
+	}
+	out, err := runIn(appDir, 30*time.Second, "git", cmdArgs...)
+	const maxOut = 200 * 1024
+	if len(out) > maxOut {
+		out = out[:maxOut] + "\n...[truncated]"
+	}
+	if err != nil {
+		return out, fmt.Sprintf("Git diff error: %v", err)
+	}
+	if out == "" {
+		out = "(no changes)"
+	}
+	return out, ""
+}
+
+func filePatch(args map[string]interface{}) (interface{}, string) {
+	path, _ := args["path"].(string)
+	oldStr, ok1 := args["old_str"].(string)
+	newStr, ok2 := args["new_str"].(string)
+	if path == "" || !ok1 || !ok2 || oldStr == "" {
+		return nil, "Missing path, old_str or new_str"
+	}
+	if !isAllowedPath(path) {
+		return nil, "Path not allowed"
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Sprintf("Stat error: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Sprintf("Read error: %v", err)
+	}
+	content := string(raw)
+	n := strings.Count(content, oldStr)
+	replaceAll, _ := args["replace_all"].(bool)
+	if n == 0 {
+		return nil, "old_str not found"
+	}
+	if n > 1 && !replaceAll {
+		return nil, fmt.Sprintf("old_str matches %d times; widen it or set replace_all", n)
+	}
+	limit := 1
+	if replaceAll {
+		limit = -1
+	}
+	if err := os.WriteFile(path, []byte(strings.Replace(content, oldStr, newStr, limit)), info.Mode().Perm()); err != nil {
+		return nil, fmt.Sprintf("Write error: %v", err)
+	}
+	if !replaceAll {
+		n = 1
+	}
+	return fmt.Sprintf("Patched %d occurrence(s)", n), ""
 }
 
 func gitStatus() (interface{}, string) {
@@ -608,35 +748,68 @@ func dbQuery(args map[string]interface{}) (interface{}, string) {
 	return results, ""
 }
 
+var denyPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`\brm\s+(-\S+\s+)*-\S*[rR]\S*\s+(-\S+\s+)*(/|~|\*|/\*|\$HOME)(\s|$)`),
+	regexp.MustCompile(`\bgit\s+push\b.*(\s--force(-with-lease)?\b|\s-f\b|\s\+\S)`),
+	regexp.MustCompile(`\bgit\s+reset\s+.*--hard\b`),
+	regexp.MustCompile(`\bgit\s+clean\s+-\S*f`),
+	regexp.MustCompile(`\bmkfs`),
+	regexp.MustCompile(`\bdd\s+.*\bof=/dev/`),
+	regexp.MustCompile(`\b(shutdown|reboot|halt|poweroff)\b`),
+	regexp.MustCompile(`:\(\)\s*\{`),
+}
+
 func execCommand(args map[string]interface{}) (interface{}, string) {
 	command, ok := args["command"].(string)
-	if !ok {
+	if !ok || command == "" {
 		return nil, "Missing command"
 	}
-
 	dir := appDir
-	if d, ok := args["dir"].(string); ok {
+	if d, ok := args["dir"].(string); ok && d != "" {
 		dir = d
 	}
-
-	var cmdArgs []string
-	if argsRaw, ok := args["args"].([]interface{}); ok {
-		for _, arg := range argsRaw {
-			if s, ok := arg.(string); ok {
-				cmdArgs = append(cmdArgs, s)
-			}
+	cmdArgs := strList(args["args"])
+	full := command + " " + strings.Join(cmdArgs, " ")
+	for _, re := range denyPatterns {
+		if re.MatchString(full) {
+			return nil, "Blocked by denylist: " + re.String()
 		}
 	}
-
-	cmd := exec.Command(command, cmdArgs...)
-	cmd.Dir = dir
-	output, err := cmd.CombinedOutput()
-
-	if err != nil {
-		return string(output), fmt.Sprintf("Exec error: %v", err)
+	timeout := 25 * time.Second
+	if t, ok := args["timeout_sec"].(float64); ok && t > 0 {
+		if t > 600 {
+			t = 600
+		}
+		timeout = time.Duration(t) * time.Second
 	}
+	out, err := runIn(dir, timeout, command, cmdArgs...)
+	if err != nil {
+		return out, fmt.Sprintf("Exec error: %v", err)
+	}
+	return out, ""
+}
 
-	return string(output), ""
+func runIn(dir string, timeout time.Duration, name string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return string(out), fmt.Errorf("timed out after %s", timeout)
+	}
+	return string(out), err
+}
+
+func strList(v interface{}) []string {
+	raw, _ := v.([]interface{})
+	out := make([]string, 0, len(raw))
+	for _, x := range raw {
+		if s, ok := x.(string); ok && s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func sendJSON(v interface{}) {

@@ -4,19 +4,34 @@ const { URL } = require('url');
 const { spawn } = require('child_process');
 
 const ISSUER = process.env.MCP_ISSUER || 'https://mcp.snaptape.in';
-const APP_DIR = process.env.APP_DIR || '/opt/app';
-const MCP_BINARY = process.env.MCP_BINARY_PATH || '/opt/mcp/mcp-server';
-const BRIDGE_HOST = process.env.MCP_BRIDGE_HOST || 'localhost';
-const BRIDGE_PORT = process.env.MCP_BRIDGE_PORT || 8765;
+const PORT = process.env.PORT || 8765;
+
+const APP_DIR = process.env.APP_DIR;
+if (!APP_DIR) {
+  console.error('APP_DIR env var is required');
+  process.exit(1);
+}
+const MCP_PASSCODE = process.env.MCP_PASSCODE;
+if (!MCP_PASSCODE) {
+  console.error('MCP_PASSCODE env var is required');
+  process.exit(1);
+}
+const MCP_PASSCODE_HASH = crypto.createHash('sha256').update(MCP_PASSCODE).digest();
 
 // in-memory stores (VM restart = re-auth, fine for single-user personal use)
 const clients = new Map();   // client_id -> {client_secret, redirect_uris}
+const pendingAuth = new Map(); // req_id -> {client_id, redirect_uri, state, code_challenge, code_challenge_method, expires}
 const codes = new Map();     // code -> {client_id, redirect_uri, code_challenge, code_challenge_method, expires}
 const tokens = new Map();    // access_token -> {client_id, expires}
 const refreshTokens = new Map(); // refresh_token -> {client_id}
+const loginAttempts = new Map(); // ip -> {failCount, lockUntil}
 
 const CODE_TTL_MS = 60 * 1000;
+const PENDING_AUTH_TTL_MS = 5 * 60 * 1000;
+const RESUBMIT_GRACE_MS = 60 * 1000;
 const TOKEN_TTL_S = 3600;
+const MAX_LOGIN_FAILURES = 5;
+const LOCKOUT_MS = 15 * 60 * 1000;
 
 function randToken(bytes = 32) {
   return crypto.randomBytes(bytes).toString('base64url');
@@ -25,6 +40,11 @@ function randToken(bytes = 32) {
 function sendJson(res, code, obj) {
   res.writeHead(code, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(obj));
+}
+
+function sendHtml(res, code, html) {
+  res.writeHead(code, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(html);
 }
 
 function corsHeaders(res) {
@@ -52,11 +72,68 @@ function parseBody(req, body) {
   return Object.fromEntries(params.entries());
 }
 
+function clientIp(req) {
+  return req.headers['x-real-ip'] || req.socket.remoteAddress || 'unknown';
+}
+
+function isLockedOut(ip) {
+  const entry = loginAttempts.get(ip);
+  return !!(entry && entry.lockUntil && entry.lockUntil > Date.now());
+}
+
+function recordLoginFailure(ip) {
+  const entry = loginAttempts.get(ip) || { failCount: 0, lockUntil: 0 };
+  entry.failCount += 1;
+  if (entry.failCount >= MAX_LOGIN_FAILURES) {
+    entry.lockUntil = Date.now() + LOCKOUT_MS;
+    entry.failCount = 0;
+  }
+  loginAttempts.set(ip, entry);
+}
+
+function recordLoginSuccess(ip) {
+  loginAttempts.delete(ip);
+}
+
+function passcodeMatches(candidate) {
+  const candidateHash = crypto.createHash('sha256').update(candidate || '').digest();
+  return crypto.timingSafeEqual(candidateHash, MCP_PASSCODE_HASH);
+}
+
+function renderLoginPage({ reqId, error, locked }) {
+  const message = locked
+    ? '<p class="err">Too many attempts. Try again later.</p>'
+    : error ? '<p class="err">Incorrect passcode.</p>' : '';
+  return `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MCP Login</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0b0b0c;color:#eee;
+  display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+form{background:#17171a;padding:2rem;border-radius:12px;width:280px;box-shadow:0 4px 24px rgba(0,0,0,.4)}
+h1{font-size:1.1rem;margin:0 0 1rem}
+input[type=password]{width:100%;box-sizing:border-box;padding:.6rem;border-radius:8px;
+  border:1px solid #333;background:#0b0b0c;color:#eee;font-size:1rem;margin-bottom:1rem}
+button{width:100%;padding:.6rem;border-radius:8px;border:none;background:#5b8cff;
+  color:#fff;font-size:1rem;cursor:pointer}
+.err{color:#ff6b6b;font-size:.85rem;margin:0 0 1rem}
+</style></head>
+<body>
+<form method="POST" action="/authorize">
+<h1>Enter passcode</h1>
+${message}
+<input type="hidden" name="req_id" value="${reqId}">
+<input type="password" name="passcode" autofocus ${locked ? 'disabled' : ''}>
+<button type="submit" ${locked ? 'disabled' : ''}>Continue</button>
+</form>
+</body></html>`;
+}
+
 function runMcp(req, res) {
   const mcp = spawn('bash', ['-c',
-    `git config --global --add safe.directory ${APP_DIR}; ` +
-    `export APP_DIR=${APP_DIR}; ` +
-    MCP_BINARY
+    `git config --global --add safe.directory '${APP_DIR}'; ` +
+    `export APP_DIR='${APP_DIR}'; ` +
+    '/opt/mcp/mcp-server'
   ]);
 
   let output = '';
@@ -87,7 +164,24 @@ function runMcp(req, res) {
       res.end('{"error":"timeout"}');
       mcp.kill();
     }
-  }, 10000);
+  }, Number(process.env.MCP_CALL_TIMEOUT_MS) || 130000);
+}
+
+function issueCodeAndRedirect(res, pending) {
+  const code = randToken(24);
+  codes.set(code, {
+    client_id: pending.client_id,
+    redirect_uri: pending.redirect_uri,
+    code_challenge: pending.code_challenge,
+    code_challenge_method: pending.code_challenge_method,
+    expires: Date.now() + CODE_TTL_MS,
+  });
+
+  const redirect = new URL(pending.redirect_uri);
+  redirect.searchParams.set('code', code);
+  if (pending.state) redirect.searchParams.set('state', pending.state);
+  res.writeHead(302, { Location: redirect.toString() });
+  res.end();
 }
 
 const server = http.createServer(async (req, res) => {
@@ -136,7 +230,7 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  // Authorization endpoint — single-user, auto-approve, no login screen
+  // Authorization endpoint — gated behind a passcode login page
   if (url.pathname === '/authorize' && req.method === 'GET') {
     const client_id = url.searchParams.get('client_id');
     const redirect_uri = url.searchParams.get('redirect_uri');
@@ -148,18 +242,46 @@ const server = http.createServer(async (req, res) => {
     if (!client) return sendJson(res, 400, { error: 'invalid_client' });
     if (!redirect_uri) return sendJson(res, 400, { error: 'invalid_request' });
 
-    const code = randToken(24);
-    codes.set(code, {
-      client_id, redirect_uri, code_challenge, code_challenge_method,
-      expires: Date.now() + CODE_TTL_MS,
+    const reqId = randToken(24);
+    pendingAuth.set(reqId, {
+      client_id, redirect_uri, state, code_challenge, code_challenge_method,
+      expires: Date.now() + PENDING_AUTH_TTL_MS,
     });
 
-    const redirect = new URL(redirect_uri);
-    redirect.searchParams.set('code', code);
-    if (state) redirect.searchParams.set('state', state);
-    res.writeHead(302, { Location: redirect.toString() });
-    res.end();
-    return;
+    return sendHtml(res, 200, renderLoginPage({ reqId, locked: isLockedOut(clientIp(req)) }));
+  }
+
+  // Authorization endpoint — passcode submission
+  if (url.pathname === '/authorize' && req.method === 'POST') {
+    const ip = clientIp(req);
+    const body = parseBody(req, await readBody(req));
+    const pending = pendingAuth.get(body.req_id);
+
+    if (!pending || pending.expires < Date.now()) {
+      return sendHtml(res, 400, '<p>Login request expired. Close this and reconnect from the app.</p>');
+    }
+
+    // A duplicate submit of an already-accepted req_id (double-tap, or the
+    // in-app browser re-posting on redirect/close) re-issues a fresh code
+    // instead of erroring — the passcode was already verified once.
+    if (pending.consumedAt && Date.now() - pending.consumedAt < RESUBMIT_GRACE_MS) {
+      return issueCodeAndRedirect(res, pending);
+    }
+
+    if (isLockedOut(ip)) {
+      return sendHtml(res, 429, renderLoginPage({ reqId: body.req_id, locked: true }));
+    }
+
+    if (!passcodeMatches(body.passcode)) {
+      recordLoginFailure(ip);
+      return sendHtml(res, 401, renderLoginPage({
+        reqId: body.req_id, error: true, locked: isLockedOut(ip),
+      }));
+    }
+
+    recordLoginSuccess(ip);
+    pending.consumedAt = Date.now();
+    return issueCodeAndRedirect(res, pending);
   }
 
   // Token endpoint
@@ -204,8 +326,12 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 400, { error: 'unsupported_grant_type' });
   }
 
-  // MCP endpoint — requires bearer token
-  if (url.pathname === '/mcp') {
+  // MCP endpoint — requires bearer token. The connector's base URL is the
+  // literal transport endpoint Claude clients POST/GET against (they don't
+  // redirect based on the `resource` field in the OAuth metadata), so this
+  // has to work at both "/" and "/mcp" regardless of which one was entered
+  // as the connector URL.
+  if (url.pathname === '/mcp' || url.pathname === '/') {
     const auth = req.headers['authorization'] || '';
     const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
     const entry = token && tokens.get(token);
@@ -215,6 +341,14 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 401, { error: 'invalid_token' });
     }
 
+    if (req.method === 'GET') {
+      // Optional server-initiated SSE stream, not implemented — per the MCP
+      // Streamable HTTP spec, 405 tells the client not to expect it rather
+      // than leaving the request hanging.
+      res.writeHead(405, { 'Allow': 'POST' });
+      return res.end();
+    }
+
     res.setHeader('Content-Type', 'application/json');
     return runMcp(req, res);
   }
@@ -222,4 +356,4 @@ const server = http.createServer(async (req, res) => {
   sendJson(res, 404, { error: 'not_found' });
 });
 
-server.listen(BRIDGE_PORT, BRIDGE_HOST, () => console.log(`MCP OAuth Bridge on http://${BRIDGE_HOST}:${BRIDGE_PORT} (behind nginx TLS)`));
+server.listen(PORT, 'localhost', () => console.log(`MCP OAuth Bridge (APP_DIR=${APP_DIR}) on http://localhost:${PORT} (behind nginx TLS)`));
